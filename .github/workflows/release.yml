@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="$TAG"
+            HEADER="Initial release"
+          else
+            RANGE="${PREV_TAG}..${TAG}"
+            HEADER="Changes since ${PREV_TAG}"
+          fi
+          LOG=$(git log --pretty=format:"- %s (%h)" "$RANGE")
+          {
+            echo "header=$HEADER"
+            echo "log<<EOF"
+            echo "$LOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 0xID ${{ github.ref_name }}
+          body: |
+            ## ${{ steps.changelog.outputs.header }}
+
+            ${{ steps.changelog.outputs.log }}
+          files: target/release/0xid.exe
+          fail_on_unmatched_files: true

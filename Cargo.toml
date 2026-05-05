@@ -1,0 +1,35 @@
+[package]
+name = "oxid"
+version = "1.0.0"
+edition = "2021"
+description = "0xID — Retro hacker plugin launcher. HACK THE PLANET."
+authors = ["infinition"]
+build = "build.rs"
+
+[[bin]]
+name = "0xid"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.30"
+image  = { version = "0.25", default-features = false, features = ["png"] }
+socket2 = { version = "0.5", features = ["all"] }
+aes-gcm  = "0.10"
+base64   = "0.22"
+rand     = "0.8"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[build-dependencies]
+winres = "0.1"
