@@ -18,11 +18,11 @@ Ctrl + Q               →   quit
 ## What it does
 
 Tabs:
-- **LAUNCHER** — runs anything you drop into `~/.0xid/apps/`
-- **SSH** — host manager, AES-256-GCM password vault (4-digit PIN), terminal, SFTP
-- **SCANNER** — local network sweep
-- **WSL2** — distro list / start / stop
-- **WOL** — Wake-on-LAN with ping status
+- **LAUNCHER** - runs anything you drop into `~/.0xid/apps/`
+- **SSH** - host manager, AES-256-GCM password vault (4-digit PIN), terminal, SFTP
+- **SCANNER** - local network sweep
+- **WSL2** - distro list / start / stop
+- **WOL** - Wake-on-LAN with ping status
 
 ## Apps
 
