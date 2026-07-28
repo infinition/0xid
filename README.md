@@ -3,7 +3,7 @@
 
 # 0xID
 
-Retro hacker plugin launcher. Single binary. No installer.
+Retro hacker plugin launcher. Single binary. No installer.  
 
 <img width="1591" height="994" alt="image" src="https://github.com/user-attachments/assets/a65d8071-9a9a-49f5-9e72-cfff6bc29cbb" />
 

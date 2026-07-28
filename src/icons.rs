@@ -126,3 +126,72 @@ unsafe fn hicon_to_rgba(hicon: isize, size: u32) -> Option<eframe::egui::ColorIm
 pub fn extract_icon(_path: &str, _size: u32) -> Option<eframe::egui::ColorImage> {
     None
 }
+
+/// Generate a placeholder icon for files that have no embedded icon.
+/// Returns a 64×64 retro-styled icon (dark background + green terminal prompt).
+pub fn placeholder_icon(size: u32) -> eframe::egui::ColorImage {
+    let s = size as usize;
+    let mut pixels = vec![0u8; s * s * 4];
+
+    for y in 0..s {
+        for x in 0..s {
+            let idx = (y * s + x) * 4;
+            let border = 3;
+            let inner = size as usize - border;
+
+            // Check if we're on the border
+            let on_border = x < border || x >= inner || y < border || y >= inner;
+
+            if on_border {
+                // Border color: dark green-gray
+                pixels[idx] = 20;     // R
+                pixels[idx + 1] = 80; // G
+                pixels[idx + 2] = 30; // B
+                pixels[idx + 3] = 255;
+            } else {
+                // Background: dark terminal
+                pixels[idx] = 15;
+                pixels[idx + 1] = 15;
+                pixels[idx + 2] = 20;
+                pixels[idx + 3] = 255;
+            }
+        }
+    }
+
+    // Draw a ">_" prompt symbol in green at center
+    let cx = s / 2;
+    let cy = s / 2;
+    let col_green = [0u8, 255, 70, 255];  // phosphor green
+    let col_cursor = [0u8, 200, 50, 255];
+
+    // ">" character (simple pixel art, ~5x7 at a small offset)
+    let glyph: &[(isize, isize)] = &[
+        // ">" shape
+        (0, -2), (0, -1), (0, 0), (0, 1), (0, 2),
+        (1, -1), (1, 0), (1, 1),
+        (2, 0),
+    ];
+    for (dx, dy) in glyph {
+        let px = cx as isize + dx;
+        let py = cy as isize + dy;
+        if px >= 0 && px < s as isize && py >= 0 && py < s as isize {
+            let idx = (py as usize * s + px as usize) * 4;
+            pixels[idx..idx + 4].copy_from_slice(&col_green);
+        }
+    }
+
+    // blinking cursor "_" below the >
+    let cursor_glyph: &[(isize, isize)] = &[
+        (-1, 3), (0, 3), (1, 3),
+    ];
+    for (dx, dy) in cursor_glyph {
+        let px = cx as isize + dx;
+        let py = cy as isize + dy;
+        if px >= 0 && px < s as isize && py >= 0 && py < s as isize {
+            let idx = (py as usize * s + px as usize) * 4;
+            pixels[idx..idx + 4].copy_from_slice(&col_cursor);
+        }
+    }
+
+    eframe::egui::ColorImage::from_rgba_unmultiplied([s, s], &pixels)
+}
