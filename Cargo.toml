@@ -1,9 +1,9 @@
 [package]
 name = "oxid"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "0xID — Retro hacker plugin launcher. HACK THE PLANET."
-authors = ["infinition"]
+authors = ["Fabien Polly <37984399+infinition@users.noreply.github.com>"]
 build = "build.rs"
 
 [[bin]]
