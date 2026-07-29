@@ -107,7 +107,13 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                 }
             });
 
-        let border_color = if app.shell_mode { CYAN } else { GREEN };
+        let border_color = if app.settings_open {
+            YELLOW
+        } else if app.shell_mode {
+            CYAN
+        } else {
+            GREEN
+        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -116,7 +122,11 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     .inner_margin(egui::Margin::same(4.0)),
             )
             .show(ctx, |ui| {
-                render_output(ui, app);
+                if app.settings_open && app.active_tab == crate::app::Tab::Launcher {
+                    render_settings(ui, app);
+                } else {
+                    render_output(ui, app);
+                }
             });
     }
 }
@@ -218,6 +228,15 @@ fn render_plugin_list(ui: &mut egui::Ui, app: &mut App) {
         return;
     }
 
+    // Scroll selected into view only when selection changes (avoids fighting
+    // mouse-wheel scroll via scroll_to_rect every frame).
+    let scroll_anchor = egui::Id::new("plugin_scroll_idx");
+    let scroll_selected = ui.ctx().data_mut(|d| {
+        let prev = d.get_persisted::<usize>(scroll_anchor).unwrap_or(usize::MAX);
+        d.insert_persisted(scroll_anchor, app.selected);
+        app.selected != prev
+    });
+
     // Scrollable list
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -314,6 +333,11 @@ fn render_plugin_list(ui: &mut egui::Ui, app: &mut App) {
                 if click_resp.clicked() {
                     app.click_entry(*i);
                 }
+
+                // Auto-scroll to keep selected entry visible (only on selection change)
+                if selected && scroll_selected {
+                    ui.scroll_to_rect(inner_resp.response.rect, Some(egui::Align::Center));
+                }
             }
         });
 
@@ -345,6 +369,15 @@ fn render_search_results(ui: &mut egui::Ui, app: &mut App) {
             Some((list_idx, p.name.clone(), p.path.clone(), list_idx == app.search_selected))
         })
         .collect();
+
+    // Only scroll to selected on *change* (not every frame), so mouse wheel
+    // scrolling works without fighting the programmatic scroll-to.
+    let search_scroll_anchor = egui::Id::new("search_scroll_idx");
+    let search_scroll_selected = ui.ctx().data_mut(|d| {
+        let prev = d.get_persisted::<usize>(search_scroll_anchor).unwrap_or(usize::MAX);
+        d.insert_persisted(search_scroll_anchor, app.search_selected);
+        app.search_selected != prev
+    });
 
     let mut clicked: Option<usize> = None;
 
@@ -379,6 +412,11 @@ fn render_search_results(ui: &mut egui::Ui, app: &mut App) {
 
                 if inner_resp.response.interact(Sense::click()).clicked() {
                     clicked = Some(*list_idx);
+                }
+
+                // Auto-scroll to keep selected entry visible (only on selection change)
+                if *selected && search_scroll_selected {
+                    ui.scroll_to_rect(inner_resp.response.rect, Some(egui::Align::Center));
                 }
             }
         });
@@ -453,6 +491,92 @@ fn render_output(ui: &mut egui::Ui, app: &mut App) {
                 .strong(),
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Settings menu ([P])
+// ──────────────────────────────────────────────────────────────────────────────
+fn render_settings(ui: &mut egui::Ui, app: &mut App) {
+    use crate::app::SettingRow;
+
+    let s = crate::settings::get();
+    let startup = app.startup_enabled();
+    let muted = crate::sounds::is_muted();
+
+    ui.label(RichText::new("\u{27e6} SETTINGS \u{27e7}").monospace().color(CYAN).strong());
+    ui.add_space(6.0);
+
+    for (idx, &row) in SettingRow::ALL.iter().enumerate() {
+        let selected = idx == app.settings_selected;
+        let editing = selected && app.settings_editing;
+        let capturing = selected && app.settings_capturing;
+
+        let value: String = if editing {
+            let cursor = if app.tick_count % 20 < 10 { "\u{2588}" } else { " " };
+            format!("{}{}", app.settings_input, cursor)
+        } else if capturing {
+            "<press a key combo\u{2026}>".to_string()
+        } else {
+            match row {
+                SettingRow::CondaEnv => {
+                    if s.conda_env.trim().is_empty() {
+                        "(none \u{2014} plain python)".to_string()
+                    } else {
+                        s.conda_env.clone()
+                    }
+                }
+                SettingRow::Hotkey => s.hotkey.clone(),
+                SettingRow::AppsDir => {
+                    if s.apps_dir.trim().is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        s.apps_dir.clone()
+                    }
+                }
+                SettingRow::EnvVars => {
+                    if s.env_vars.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        s.env_vars.join(" ; ")
+                    }
+                }
+                SettingRow::Mute => if muted { "ON".to_string() } else { "OFF".to_string() },
+                SettingRow::Startup => if startup { "ON".to_string() } else { "OFF".to_string() },
+            }
+        };
+
+        let marker = if selected { "\u{25b6} " } else { "  " };
+        let label_col = if selected { GREEN } else { GREEN_DIM };
+        let val_col = if editing || capturing { YELLOW } else { CYAN };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{}{:<20}", marker, row.label()))
+                    .monospace()
+                    .color(label_col)
+                    .strong(),
+            );
+            ui.label(RichText::new(value).monospace().color(val_col).strong());
+        });
+        ui.add_space(2.0);
+    }
+
+    ui.add_space(10.0);
+    let hint = if app.settings_editing {
+        "[ENTER] save   [ESC] cancel    (env vars: KEY=VALUE separated by  ;)"
+    } else if app.settings_capturing {
+        "Press the combo (e.g. Ctrl+Shift+Space).   [ESC] cancel"
+    } else {
+        "[\u{2191}/\u{2193}] move    [ENTER] edit / toggle    [ESC] close"
+    };
+    ui.label(RichText::new(hint).monospace().color(YELLOW));
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Saved automatically. Conda env empty = use plain python.")
+            .monospace()
+            .color(GREEN_DIM)
+            .weak(),
+    );
 }
 
 fn output_style(line: &str) -> (Color32, bool) {
@@ -876,8 +1000,8 @@ fn render_scanner(ui: &mut egui::Ui, app: &mut App) {
 
         // Table header
         let hdr = format!(
-            " {:<3} {:<16} {:<18} {:<10} {:<6} {}",
-            "#", "IP ADDRESS", "HOSTNAME", "VENDOR", "PORTS", "OPEN SERVICES"
+            " {:<3} {:<17} {:<18} {:<18} {:<10} {:<6} {}",
+            "#", "MAC", "IP ADDRESS", "HOSTNAME", "VENDOR", "PORTS", "OPEN SERVICES"
         );
         ui.label(RichText::new(&hdr).monospace().color(CYAN).strong());
         ui.label(
@@ -899,46 +1023,75 @@ fn render_scanner(ui: &mut egui::Ui, app: &mut App) {
                     let status_dot = "\u{25cf}"; // ●
                     let vendor = if host.vendor.is_empty() { "-" } else { &host.vendor };
                     let hostname = if host.hostname.is_empty() { "-" } else { &host.hostname };
+                    let mac_display = if host.mac.is_empty() { "-" } else { &*host.mac };
 
-                    let ports_str: String = host
+                    // Build port tokens — web ports are clickable links
+                    let port_tokens: Vec<(String, bool)> = host
                         .open_ports
                         .iter()
                         .map(|&p| {
                             let svc = crate::scanner::port_service_name(p);
-                            if svc.is_empty() {
+                            let label = if svc.is_empty() {
                                 format!("{}", p)
                             } else {
                                 format!("{}:{}", p, svc)
-                            }
+                            };
+                            let is_web = matches!(p, 80 | 443 | 8080 | 8443 | 3000 | 5000 | 8000 | 8888 | 9443 | 8081 | 8008 | 3001);
+                            (label, is_web)
                         })
-                        .collect::<Vec<_>>()
-                        .join("  ");
-
-                    let row = format!(
-                        " {:<3} {} {:<16} {:<18} {:<10} {:<6} {}",
-                        i + 1,
-                        status_dot,
-                        host.ip,
-                        hostname,
-                        vendor,
-                        host.open_ports.len(),
-                        ports_str,
-                    );
+                        .collect();
 
                     let frame = egui::Frame::default()
                         .fill(bg)
                         .inner_margin(egui::Margin::symmetric(0.0, 1.0));
 
                     let resp = frame.show(ui, |ui: &mut egui::Ui| {
-                        ui.set_width(ui.available_width());
-                        let color = if selected { GREEN } else { Color32::from_rgb(0, 200, 55) };
-                        ui.label(RichText::new(&row).monospace().color(color));
+                        ui.horizontal(|ui| {
+                            let color = if selected { GREEN } else { Color32::from_rgb(0, 200, 55) };
+
+                            // Fixed columns: MAC, #, dot, IP, hostname, vendor, port count
+                            ui.label(
+                                RichText::new(format!(
+                                    " {:<17} {:<3} {} {:<16} {:<18} {:<10} {:<6}",
+                                    mac_display, i + 1, status_dot, host.ip, hostname, vendor, host.open_ports.len(),
+                                ))
+                                .monospace()
+                                .color(color),
+                            );
+
+                            // Port tokens — web ports are clickable links
+                            for (pi, (port_label, is_web)) in port_tokens.iter().enumerate() {
+                                if pi > 0 {
+                                    ui.label(RichText::new("  ").monospace().color(color));
+                                }
+                                if *is_web {
+                                    let scheme = if host.open_ports[pi] == 443 || host.open_ports[pi] == 8443 { "https" } else { "http" };
+                                    let url = format!("{}://{}:{}", scheme, host.ip, host.open_ports[pi]);
+                                    let url_clone = url.clone();
+                                    // Use egui's built-in hyperlink which properly handles
+                                    // open-in-browser on every platform.
+                                    if ui.link(port_label).clicked() {
+                                        let u = url_clone;
+                                        std::thread::spawn(move || {
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(&u)
+                                                .spawn();
+                                        });
+                                    }
+                                } else {
+                                    ui.label(RichText::new(port_label).monospace().color(color));
+                                }
+                            }
+                        });
                     });
 
-                    if resp.response.interact(Sense::click()).clicked() {
+                    // Row click for selection (handled separately so port-link clicks
+                    // above are not swallowed by the row's click sense).
+                    if resp.response.clicked() {
                         app.scan_selected = i;
                         crate::sounds::nav();
                     }
+
                 }
             });
     }

@@ -1,4 +1,4 @@
-use eframe::egui;
+﻿use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ChildStdin;
@@ -138,10 +138,52 @@ pub struct App {
     pub wol_add_input: String,
     wol_add_name: String,
     wol_add_mac: String,
+    // Settings menu ([P])
+    pub settings_open: bool,
+    pub settings_selected: usize,
+    pub settings_editing: bool,    // editing a text field
+    pub settings_input: String,    // text edit buffer
+    pub settings_capturing: bool,  // capturing a hotkey combo
+}
+
+/// Rows in the settings menu, in display order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingRow {
+    CondaEnv,
+    Hotkey,
+    AppsDir,
+    EnvVars,
+    Mute,
+    Startup,
+}
+
+impl SettingRow {
+    pub const ALL: &'static [SettingRow] = &[
+        SettingRow::CondaEnv,
+        SettingRow::Hotkey,
+        SettingRow::AppsDir,
+        SettingRow::EnvVars,
+        SettingRow::Mute,
+        SettingRow::Startup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingRow::CondaEnv => "Conda env (.py)",
+            SettingRow::Hotkey => "Trigger hotkey",
+            SettingRow::AppsDir => "Apps folder",
+            SettingRow::EnvVars => "Custom env vars",
+            SettingRow::Mute => "Mute sound",
+            SettingRow::Startup => "Start with Windows",
+        }
+    }
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, start_hidden: bool) -> Self {
+        // Load persisted settings (e.g. mute) before any sound plays.
+        sounds::init_muted();
+
         // Set all text to monospace
         let mut style = (*cc.egui_ctx.style()).clone();
         let mono_14 = egui::FontId::monospace(14.0);
@@ -152,7 +194,7 @@ impl App {
         style.text_styles.insert(egui::TextStyle::Monospace, mono_14);
         cc.egui_ctx.set_style(style);
 
-        let tray = TrayManager::new();
+        let tray = TrayManager::new(start_hidden);
 
         let base_dir = apps_dir();
         let entries = discover_entries(&base_dir, false);
@@ -182,7 +224,7 @@ impl App {
             ));
         }
 
-        output.push("> Press [?] for keybindings, [ENTER] to launch.".to_string());
+        output.push("> Press [H] for keybindings, [P] for settings, [ENTER] to launch.".to_string());
         output.push(String::new());
         output.push("> Awaiting orders...".to_string());
 
@@ -258,6 +300,11 @@ impl App {
             wol_add_input: String::new(),
             wol_add_name: String::new(),
             wol_add_mac: String::new(),
+            settings_open: false,
+            settings_selected: 0,
+            settings_editing: false,
+            settings_input: String::new(),
+            settings_capturing: false,
         }
     }
 
@@ -282,7 +329,75 @@ impl App {
                 return;
             }
 
-            if self.shell_mode {
+            if self.settings_open {
+                // ── Settings menu ([P]) ──
+                if self.settings_capturing {
+                    // Capturing a new trigger hotkey combo
+                    if i.key_pressed(egui::Key::Escape) {
+                        self.settings_capturing = false;
+                        return;
+                    }
+                    let mut captured: Option<egui::Key> = None;
+                    for event in &i.events {
+                        if let egui::Event::Key { key, pressed: true, .. } = event {
+                            captured = Some(*key);
+                            break;
+                        }
+                    }
+                    if let Some(key) = captured {
+                        if let Some(hk) = format_hotkey(&i.modifiers, key) {
+                            self.apply_hotkey(hk);
+                            self.settings_capturing = false;
+                        }
+                    }
+                    return;
+                }
+                if self.settings_editing {
+                    // Editing a text field
+                    if i.key_pressed(egui::Key::Escape) {
+                        self.settings_editing = false;
+                        self.settings_input.clear();
+                        return;
+                    }
+                    if i.key_pressed(egui::Key::Enter) {
+                        self.commit_settings_edit();
+                        return;
+                    }
+                    if i.key_pressed(egui::Key::Backspace) {
+                        self.settings_input.pop();
+                        return;
+                    }
+                    for event in &i.events {
+                        if let egui::Event::Text(text) = event {
+                            self.settings_input.push_str(text);
+                        }
+                    }
+                    return;
+                }
+                // Navigation
+                if i.key_pressed(egui::Key::Escape) {
+                    self.close_settings();
+                    return;
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    if self.settings_selected > 0 {
+                        self.settings_selected -= 1;
+                        sounds::nav();
+                    }
+                    return;
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    if self.settings_selected + 1 < SettingRow::ALL.len() {
+                        self.settings_selected += 1;
+                        sounds::nav();
+                    }
+                    return;
+                }
+                if i.key_pressed(egui::Key::Enter) {
+                    self.activate_setting_row();
+                    return;
+                }
+            } else if self.shell_mode {
                 // Shell mode: keys go to shell input
                 if i.key_pressed(egui::Key::Escape) {
                     self.exit_shell_mode();
@@ -378,8 +493,10 @@ impl App {
                                         'k' | 'K' => self.kill_selected(),
                                         'r' | 'R' => self.refresh_entries(),
                                         'c' | 'C' => self.clear_output(),
+                                        'm' | 'M' => self.toggle_mute(),
+                                        'p' | 'P' => self.open_settings(),
+                                        'h' | 'H' | '?' => self.show_help(),
                                         '/' => self.enter_shell_mode(),
-                                        '?' => self.show_help(),
                                         _ => {}
                                     }
                                 }
@@ -1075,11 +1192,26 @@ impl App {
             use std::io::BufRead;
             use std::process::Stdio;
 
+            let invocation = match python_invocation() {
+                Some(tokens) => tokens,
+                None => {
+                    let _ = tx.send(
+                        "> [ERROR] No Python found. Install Python (on PATH) or a conda '0xid' env."
+                            .to_string(),
+                    );
+                    return;
+                }
+            };
+
             let mut cmd = std::process::Command::new("cmd");
-            cmd.args(["/C", "conda", "run", "-n", "0xid", "python", &path]);
+            let mut shell_args: Vec<String> = vec!["/C".to_string()];
+            shell_args.extend(invocation);
+            shell_args.push(path.clone());
             if let Some(ref a) = args {
-                cmd.args(a);
+                shell_args.extend(a.iter().cloned());
             }
+            cmd.args(&shell_args);
+            apply_custom_env(&mut cmd);
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
 
@@ -1159,6 +1291,8 @@ impl App {
             c
         };
 
+        apply_custom_env(&mut cmd);
+
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1201,6 +1335,124 @@ impl App {
         self.push("> Output cleared. Awaiting orders...");
     }
 
+    fn toggle_mute(&mut self) {
+        let muted = sounds::toggle_muted();
+        self.push(String::new());
+        if muted {
+            self.push("> [MUTE] Sound OFF. Setting saved.");
+            self.status = "0xID@ROOT:~$ sound muted".to_string();
+        } else {
+            self.push("> [MUTE] Sound ON. Setting saved.");
+            self.status = "0xID@ROOT:~$ sound unmuted".to_string();
+            sounds::nav(); // audible confirmation that sound is back
+        }
+    }
+
+    // ── Settings menu ([P]) ───────────────────────────────────────────────────
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.settings_selected = 0;
+        self.settings_editing = false;
+        self.settings_capturing = false;
+        self.settings_input.clear();
+        self.status = "0xID@ROOT:~$ settings".to_string();
+        sounds::enter();
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.settings_editing = false;
+        self.settings_capturing = false;
+        self.settings_input.clear();
+        self.status = "0xID@ROOT:~$ settings saved".to_string();
+        sounds::back();
+    }
+
+    /// Whether "Start with Windows" is currently enabled (for the UI).
+    pub fn startup_enabled(&self) -> bool {
+        self.tray.startup_enabled()
+    }
+
+    fn selected_setting(&self) -> SettingRow {
+        let idx = self.settings_selected.min(SettingRow::ALL.len() - 1);
+        SettingRow::ALL[idx]
+    }
+
+    /// Enter / toggle the currently selected settings row.
+    fn activate_setting_row(&mut self) {
+        match self.selected_setting() {
+            SettingRow::CondaEnv => {
+                self.settings_input = crate::settings::get().conda_env;
+                self.settings_editing = true;
+            }
+            SettingRow::AppsDir => {
+                self.settings_input = crate::settings::get().apps_dir;
+                self.settings_editing = true;
+            }
+            SettingRow::EnvVars => {
+                self.settings_input = crate::settings::get().env_vars.join(" ; ");
+                self.settings_editing = true;
+            }
+            SettingRow::Hotkey => {
+                self.settings_capturing = true;
+            }
+            SettingRow::Mute => {
+                let muted = sounds::toggle_muted();
+                if !muted {
+                    sounds::nav();
+                }
+            }
+            SettingRow::Startup => {
+                self.tray.toggle_startup();
+                sounds::nav();
+            }
+        }
+    }
+
+    /// Commit the text field currently being edited.
+    fn commit_settings_edit(&mut self) {
+        let row = self.selected_setting();
+        let mut s = crate::settings::get();
+        let mut apps_dir_changed = false;
+        match row {
+            SettingRow::CondaEnv => s.conda_env = self.settings_input.trim().to_string(),
+            SettingRow::AppsDir => {
+                s.apps_dir = self.settings_input.trim().to_string();
+                apps_dir_changed = true;
+            }
+            SettingRow::EnvVars => {
+                s.env_vars = self
+                    .settings_input
+                    .split([';', '\n'])
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| p.contains('=') && p.split_once('=').map_or(false, |(k, _)| !k.trim().is_empty()))
+                    .collect();
+            }
+            _ => {}
+        }
+        crate::settings::save(&s);
+        self.settings_editing = false;
+        self.settings_input.clear();
+        sounds::nav();
+
+        if apps_dir_changed {
+            // Re-scan from the (possibly new) plugin root.
+            self.dir_stack.clear();
+            self.current_dir = crate::plugins::apps_dir();
+            self.refresh_entries();
+        }
+    }
+
+    /// Persist a new hotkey and re-register it live.
+    fn apply_hotkey(&mut self, hotkey: String) {
+        let mut s = crate::settings::get();
+        s.hotkey = hotkey;
+        crate::settings::save(&s);
+        self.tray.update_hotkey();
+        sounds::enter();
+    }
+
     fn show_help(&mut self) {
         self.push(String::new());
         self.push("  KEYBINDINGS");
@@ -1216,13 +1468,20 @@ impl App {
         self.push("  [/]                 Shell mode (type commands)");
         self.push("  [R]                 Refresh");
         self.push("  [C]                 Clear output");
-        self.push("  [?]                 This help");
+        let mute_label = if sounds::is_muted() {
+            "  [M]                 Toggle mute (currently: OFF)"
+        } else {
+            "  [M]                 Toggle mute (currently: ON)"
+        };
+        self.push(mute_label);
+        self.push("  [P]                 Settings (conda env, hotkey, apps dir…)");
+        self.push("  [H/?]               This help");
         self.push("  [Q/ESC]             Minimize to tray");
         self.push("  [Ctrl+Q/Ctrl+C]     Quit completely");
         self.push("  [Ctrl+Shift+Space]  Restore from tray");
         self.push(String::new());
         self.push("> .py scripts run inline (output here). Use [I] for GUI scripts.");
-        self.push("> Supports: .exe .bat .cmd .ps1 .py .lnk (conda 0xid for .py)");
+        self.push("> Supports: .exe .bat .cmd .ps1 .py .lnk (.py: conda 0xid, else python)");
     }
 
     pub fn refresh_entries(&mut self) {
@@ -1798,8 +2057,101 @@ impl App {
                             egui::TextureOptions::LINEAR,
                         );
                         self.icon_textures.insert(plugin.path.clone(), texture);
+                    } else {
+                        // Placeholder icon for files without embedded icons
+                        let placeholder = crate::icons::placeholder_icon(64);
+                        let texture = ctx.load_texture(
+                            format!("icon_placeholder_{}", plugin.path),
+                            placeholder,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.icon_textures.insert(plugin.path.clone(), texture);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Is an executable named `name` (with a Windows extension) present on PATH?
+#[cfg(windows)]
+fn exe_in_path(name: &str) -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    let exts = [".exe", ".bat", ".cmd", ""];
+    std::env::split_paths(&path).any(|dir| {
+        exts.iter()
+            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+    })
+}
+
+/// Decide how to run a `.py` script. Prefers the conda `0xid` environment;
+/// if conda isn't on PATH, falls back to a plain python interpreter
+/// (`python`, then `py`, then `python3`). Returns the token list to insert
+/// after `cmd /C`, or `None` if nothing suitable was found.
+#[cfg(windows)]
+fn python_invocation() -> Option<Vec<String>> {
+    // Conda env name comes from settings. Empty = skip conda, use plain python.
+    let conda_env = crate::settings::get().conda_env;
+    let conda_env = conda_env.trim();
+    if !conda_env.is_empty() && exe_in_path("conda") {
+        return Some(
+            ["conda", "run", "-n", conda_env, "python"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+    }
+    for cand in ["python", "py", "python3"] {
+        if exe_in_path(cand) {
+            return Some(vec![cand.to_string()]);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn python_invocation() -> Option<Vec<String>> {
+    Some(vec!["python3".to_string()])
+}
+
+/// Build a hotkey string (e.g. "Ctrl+Shift+Space") from egui modifiers + key.
+/// Returns None for keys that aren't usable as a global hotkey.
+fn format_hotkey(mods: &egui::Modifiers, key: egui::Key) -> Option<String> {
+    let name = key.name();
+    let usable = (name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric())
+        || (name.starts_with('F') && name[1..].parse::<u32>().is_ok())
+        || matches!(name, "Space" | "Enter" | "Tab");
+    if !usable {
+        return None;
+    }
+    // Require at least one modifier so we never hijack a bare key globally.
+    if !(mods.ctrl || mods.alt || mods.shift) {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if mods.ctrl {
+        parts.push("Ctrl");
+    }
+    if mods.alt {
+        parts.push("Alt");
+    }
+    if mods.shift {
+        parts.push("Shift");
+    }
+    parts.push(name);
+    Some(parts.join("+"))
+}
+
+/// Inject the user's custom "KEY=VALUE" env vars (from settings) into a command.
+fn apply_custom_env(cmd: &mut std::process::Command) {
+    for kv in crate::settings::get().env_vars {
+        if let Some((k, v)) = kv.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() {
+                cmd.env(k, v);
             }
         }
     }
@@ -1829,10 +2181,7 @@ impl eframe::App for App {
             }
         }
 
-        // Always request repaint for animations + tray polling
-        ctx.request_repaint_after(Duration::from_millis(50));
-
-        // Poll tray events
+        // Poll tray events (always run — we need to see Show/Quit even when hidden)
         while let Some(event) = self.tray.poll() {
             match event {
                 TrayEvent::Show => {
@@ -1853,6 +2202,24 @@ impl eframe::App for App {
             self.tray.hide();
         }
 
+        // ── When hidden (minimized to tray), stop the repaint loop ─────────
+        // The tray thread has a copy of the egui context and calls
+        // `ctx.request_repaint()` on hotkey press / icon click, so we'll
+        // wake up immediately when needed.  Without this early return the
+        // `request_repaint_after(50ms)` below keeps the event loop spinning
+        // at 20 Hz even though there is nothing to render, costing ~13 % CPU.
+        if !self.visible {
+            if !self.hwnd_found {
+                // Still need to discover the HWND (rare: --hidden startup).
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+            // else: fully idle -- tray thread wakes us via ctx.request_repaint().
+            return;
+        }
+
+        // Request repaint for animations + tray polling (only when visible)
+        ctx.request_repaint_after(Duration::from_millis(50));
+
         // Load icons lazily (once)
         if !self.icons_loaded {
             self.load_icons(ctx);
@@ -1863,9 +2230,7 @@ impl eframe::App for App {
         self.handle_input(ctx);
 
         // Render UI
-        if self.visible {
-            ui::render(ctx, self);
-        }
+        ui::render(ctx, self);
 
         // Tick (animations + drain output)
         self.tick();

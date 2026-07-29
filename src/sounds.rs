@@ -1,6 +1,12 @@
 // Retro hacker sound effects via Windows Beep API.
 // All sounds are non-blocking (spawned on background threads).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global mute flag. Persisted to `<data_dir>/settings.json` so it survives
+/// restarts. Toggled with the [M] key.
+static MUTED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(windows)]
 extern "system" {
     fn Beep(dwFreq: u32, dwDuration: u32) -> i32;
@@ -17,7 +23,37 @@ fn tone(freq: u32, dur: u32) {
 fn tone(_freq: u32, _dur: u32) {}
 
 fn play(f: impl FnOnce() + Send + 'static) {
+    if MUTED.load(Ordering::Relaxed) {
+        return;
+    }
     std::thread::spawn(f);
+}
+
+// ── Mute state + persistence (backed by `settings`) ─────────────────────────
+
+/// Sync the in-memory mute flag from persisted settings. Call once at startup,
+/// before any sound is played.
+pub fn init_muted() {
+    MUTED.store(crate::settings::get().muted, Ordering::Relaxed);
+}
+
+pub fn is_muted() -> bool {
+    MUTED.load(Ordering::Relaxed)
+}
+
+/// Force a specific mute state, persist it.
+pub fn set_muted(muted: bool) {
+    let mut s = crate::settings::get();
+    s.muted = muted;
+    crate::settings::save(&s);
+    MUTED.store(muted, Ordering::Relaxed);
+}
+
+/// Flip mute on/off, persist it, and return the new state.
+pub fn toggle_muted() -> bool {
+    let muted = !is_muted();
+    set_muted(muted);
+    muted
 }
 
 /// Quick tick when navigating up/down

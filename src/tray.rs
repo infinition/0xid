@@ -11,7 +11,7 @@ pub enum TrayEvent {
 mod platform {
     use super::TrayEvent;
     use std::sync::{
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc, Mutex,
     };
 
@@ -22,6 +22,8 @@ mod platform {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     const WM_TRAYICON: u32 = WM_USER + 1;
+    /// Posted to the tray window to re-read and re-register the global hotkey.
+    const WM_REHOTKEY: u32 = WM_USER + 2;
     const HOTKEY_ID: i32 = 1;
 
     static TRAY_SENDER: Mutex<Option<mpsc::Sender<TrayEvent>>> = Mutex::new(None);
@@ -29,17 +31,30 @@ mod platform {
     /// The egui application window HWND — set on first frame
     static APP_HWND: AtomicIsize = AtomicIsize::new(0);
     static EGUI_CTX: Mutex<Option<eframe::egui::Context>> = Mutex::new(None);
+    /// While true, an enforcer thread keeps the app window hidden. Used at
+    /// Windows startup (`--hidden`) to kill the black-window flash that appears
+    /// before the GPU finishes initializing. Cleared the moment Show is requested.
+    static ENFORCE_HIDDEN: AtomicBool = AtomicBool::new(false);
 
     pub struct TrayManager {
         rx: mpsc::Receiver<TrayEvent>,
     }
 
     impl TrayManager {
-        pub fn new() -> Self {
+        pub fn new(start_hidden: bool) -> Self {
             let (tx, rx) = mpsc::channel();
             *TRAY_SENDER.lock().unwrap() = Some(tx);
 
             std::thread::spawn(|| unsafe { tray_thread() });
+
+            // At Windows startup the app launches with `--hidden`. winit's
+            // `with_visible(false)` alone is not enough at boot: the borderless
+            // window can flash black before the first paint. Spin a short-lived
+            // enforcer that force-hides the window the instant it appears.
+            if start_hidden {
+                ENFORCE_HIDDEN.store(true, Ordering::SeqCst);
+                std::thread::spawn(|| unsafe { enforce_hidden_thread() });
+            }
 
             // Give the tray thread a moment to set up
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -69,6 +84,26 @@ mod platform {
                     ShowWindow(hwnd, SW_HIDE);
                 }
             }
+        }
+
+        /// Ask the tray thread to re-read and re-register the global hotkey.
+        pub fn update_hotkey(&self) {
+            let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+            if hwnd != 0 {
+                unsafe {
+                    PostMessageW(hwnd, WM_REHOTKEY, 0, 0);
+                }
+            }
+        }
+
+        /// Whether "Start with Windows" is currently enabled.
+        pub fn startup_enabled(&self) -> bool {
+            is_startup_enabled()
+        }
+
+        /// Toggle the "Start with Windows" registry entry.
+        pub fn toggle_startup(&self) {
+            toggle_startup();
         }
 
         /// Show the egui window via Win32 ShowWindow
@@ -104,6 +139,49 @@ mod platform {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Parse a hotkey string like "Ctrl+Shift+Space" into (modifiers, vk).
+    /// Falls back to Ctrl+Shift+Space if no key is recognized.
+    fn parse_hotkey(s: &str) -> (u32, u32) {
+        let mut mods: u32 = 0;
+        let mut vk: u32 = 0;
+        for part in s.split('+') {
+            match part.trim().to_ascii_uppercase().as_str() {
+                "CTRL" | "CONTROL" => mods |= MOD_CONTROL,
+                "ALT" => mods |= MOD_ALT,
+                "SHIFT" => mods |= MOD_SHIFT,
+                "WIN" | "SUPER" | "META" | "CMD" => mods |= MOD_WIN,
+                "SPACE" => vk = VK_SPACE as u32,
+                "ENTER" | "RETURN" => vk = VK_RETURN as u32,
+                "TAB" => vk = VK_TAB as u32,
+                other => {
+                    if other.len() == 1 {
+                        let c = other.as_bytes()[0];
+                        if c.is_ascii_alphanumeric() {
+                            vk = c.to_ascii_uppercase() as u32;
+                        }
+                    } else if let Some(num) = other.strip_prefix('F') {
+                        if let Ok(n) = num.parse::<u32>() {
+                            if (1..=24).contains(&n) {
+                                vk = VK_F1 as u32 + (n - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if vk == 0 {
+            return (MOD_CONTROL | MOD_SHIFT, VK_SPACE as u32);
+        }
+        (mods, vk)
+    }
+
+    /// (Re)register the global hotkey from the current settings.
+    unsafe fn register_hotkey_from_settings(hwnd: HWND) {
+        let (mods, vk) = parse_hotkey(&crate::settings::get().hotkey);
+        UnregisterHotKey(hwnd, HOTKEY_ID);
+        RegisterHotKey(hwnd, HOTKEY_ID, mods, vk);
     }
 
     fn wide_tip(s: &str) -> [u16; 128] {
@@ -220,12 +298,31 @@ mod platform {
 
     /// Directly show the app window from the tray thread
     fn show_app_window() {
+        // Any explicit Show request cancels the startup hide-enforcer so it
+        // doesn't fight the window back into hiding.
+        ENFORCE_HIDDEN.store(false, Ordering::SeqCst);
         let hwnd = APP_HWND.load(Ordering::SeqCst);
         if hwnd != 0 {
             unsafe {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
             }
+        }
+    }
+
+    /// Force-hide the app window until it's stable or Show is requested.
+    /// Runs only at `--hidden` startup; self-terminates after ~5s as a safety net.
+    unsafe fn enforce_hidden_thread() {
+        let title = wide("0xID");
+        let mut count = 0;
+        while ENFORCE_HIDDEN.load(Ordering::SeqCst) && count < 1000 {
+            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            if hwnd != 0 {
+                ShowWindow(hwnd, SW_HIDE);
+                APP_HWND.store(hwnd, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            count += 1;
         }
     }
 
@@ -294,8 +391,8 @@ mod platform {
         nid.szTip = wide_tip("0xID \u{2014} Ctrl+Shift+Space");
         Shell_NotifyIconW(NIM_ADD, &nid);
 
-        // Global hotkey: Ctrl + Shift + Space
-        RegisterHotKey(hwnd, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_SPACE as u32);
+        // Global hotkey from settings (default Ctrl + Shift + Space)
+        register_hotkey_from_settings(hwnd);
 
         // Message pump
         let mut msg: MSG = std::mem::zeroed();
@@ -315,9 +412,14 @@ mod platform {
     ) -> LRESULT {
         match msg {
             WM_HOTKEY if wparam == HOTKEY_ID as usize => {
-                // Ctrl+Shift+Space: show window immediately + send event
+                // Trigger hotkey: show window immediately + send event
                 show_app_window();
                 send_event(TrayEvent::Show);
+                0
+            }
+            x if x == WM_REHOTKEY => {
+                // Settings changed the hotkey: re-register it live.
+                register_hotkey_from_settings(hwnd);
                 0
             }
             x if x == WM_TRAYICON => {
@@ -399,7 +501,7 @@ mod platform {
     pub struct TrayManager;
 
     impl TrayManager {
-        pub fn new() -> Self {
+        pub fn new(_start_hidden: bool) -> Self {
             TrayManager
         }
         pub fn poll(&self) -> Option<TrayEvent> {
@@ -409,6 +511,11 @@ mod platform {
         pub fn set_egui_ctx(&self, _ctx: eframe::egui::Context) {}
         pub fn hide(&self) {}
         pub fn show(&self) {}
+        pub fn update_hotkey(&self) {}
+        pub fn startup_enabled(&self) -> bool {
+            false
+        }
+        pub fn toggle_startup(&self) {}
     }
 }
 

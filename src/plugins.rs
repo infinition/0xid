@@ -13,9 +13,15 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-/// Returns `<data_dir>/apps` and creates it if missing.
+/// Returns the plugin folder and creates it if missing. Honors a custom path
+/// from settings; falls back to `<data_dir>/apps`.
 pub fn apps_dir() -> PathBuf {
-    let dir = data_dir().join("apps");
+    let custom = crate::settings::get().apps_dir;
+    let dir = if custom.trim().is_empty() {
+        data_dir().join("apps")
+    } else {
+        PathBuf::from(custom.trim())
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
