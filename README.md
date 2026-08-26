@@ -1,5 +1,7 @@
 
-<img width="150" height="150" alt="0xid" src="https://github.com/user-attachments/assets/ffcf7d64-e040-4495-a1d1-a96cbaaeb148" />
+<p align="center">
+  <img src=".github/0xid.png" alt="0xid icon" width="150" height="150" />
+</p>
 
 # 0xID
 
